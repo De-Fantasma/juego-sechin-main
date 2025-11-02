@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Juego estilo Mario - Asteka</title>
+<style>
+  html,body{height:100%;margin:0;background:#000}
+  #gameCanvas{display:block;margin:0 auto;background:#87ceeb; image-rendering: pixelated;}
+  .info {
+    color: #fff; font-family: Arial, sans-serif; text-align:center; margin:8px 0;
+  }
+</style>
+</head>
+<body>
+  <div class="info">Flechas ← → para moverte • Espacio o ↑ para saltar • Salta encima del enemigo para eliminarlo</div>
+  <canvas id="gameCanvas" width="960" height="540"></canvas>
+
+<script>
+/*
+  Juego de plataforma básico:
+  - Usa imágenes locales en /assets/
+  - Física simple: gravedad, salto, colisiones AABB
+  - Eliminar enemigo al saltar encima (stomp). Morir si colisionas por los lados.
+*/
+
+// --- Config ---
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const SCALE = 1;
+const GRAVITY = 1200; // px/s^2
+const MOVE_SPEED = 220; // px/s
+const JUMP_SPEED = 620; // px/s
+const TILE_SIZE = 48;
+const AUTO_SCROLL_SPEED = 100; // Velocidad de desplazamiento automático
+const WORLD_WIDTH = canvas.width * 3; // 3 pantallas de ancho
+const FINISH_LINE = WORLD_WIDTH - 100; // Línea de meta cerca del final del nivel
+
+// --- Carga de imágenes ---
+const images = {};
+const loadImage = (key, src) => {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.src = src;
+    img.onload = ()=>{ images[key]=img; res(img); };
+    img.onerror = rej;
+  });
+};
+
+// Cambia estos nombres por los archivos que descargues localmente
+const assets = [
+  loadImage('bg', 'assets/background.png'),
+  loadImage('char', 'assets/character.png'),
+  loadImage('enemy', 'assets/enemy.png'),
+];
+
+// --- Utilidades ---
+function rectsOverlap(a,b){
+  return !(a.x + a.w < b.x || a.x > b.x + b.w || a.y + a.h < b.y || a.y > b.y + b.h);
+}
+
+// --- Jugador ---
+const player = {
+  x: 80, y: 360, w: 40, h: 48,
+  vx: 0, vy: 0,
+  onGround: false,
+  facing: 1, // 1 derecha, -1 izquierda
+  alive: true,
+  frame: 0,
+};
+
+// --- Enemigos generados aleatoriamente ---
+let enemies = [];
+
+// Función para generar enemigos aleatorios
+function generateRandomEnemies() {
+  enemies = [];
+  const numEnemies = Math.floor(Math.random() * 4) + 4; // Entre 4 y 7 enemigos
+  
+  for (let i = 0; i < numEnemies; i++) {
+    const enemyX = Math.random() * (WORLD_WIDTH - 500) + 400; // Evitar que aparezcan muy cerca del inicio
+    
+    enemies.push({
+      x: enemyX,
+      y: 340,
+      w: 40,
+      h: 80,
+      vx: -40 - Math.random() * 40, // Velocidad aleatoria entre -40 y -80
+      alive: true
+    });
+  }
+}
+
+// --- Proyectiles ---
+let projectiles = [];
+
+// --- Plataformas generadas aleatoriamente ---
+let platforms = [];
+
+// Función para generar plataformas aleatorias
+function generateRandomPlatforms() {
+  platforms = [];
+  
+  // Suelo principal que cubre todo el mundo
+  platforms.push({x:0, y:440, w:WORLD_WIDTH, h:100});
+  
+  // Generar plataformas aleatorias a lo largo del mundo
+  const numPlatforms = 20; // Número de plataformas adicionales
+  
+  for (let i = 0; i < numPlatforms; i++) {
+    const platformWidth = Math.random() * 150 + 50; // Entre 50 y 200 de ancho
+    const platformX = Math.random() * (WORLD_WIDTH - platformWidth);
+    const platformY = Math.random() * 200 + 200; // Entre y=200 y y=400
+    
+    platforms.push({
+      x: platformX,
+      y: platformY,
+      w: platformWidth,
+      h: 24
+    });
+  }
+}
+
+// --- Input ---
+const keys = {};
+let lastProjectileTime = 0; // Para controlar la frecuencia de disparo
+window.addEventListener('keydown', e => { 
+  keys[e.key] = true; 
+  if (["ArrowUp"," "].includes(e.key)) e.preventDefault(); 
+  
+  // Disparar proyectil con la tecla T
+  if (e.key.toLowerCase() === 't' && player.alive) {
+    const currentTime = performance.now();
+    if (currentTime - lastProjectileTime > 500) { // Limitar a un proyectil cada 500ms
+      lastProjectileTime = currentTime;
+      projectiles.push({
+        x: player.x + player.w/2 - 10, // Centrado horizontalmente
+        y: player.y, // Sale desde la parte superior del jugador
+        w: 20, // Ancho del proyectil
+        h: 20, // Alto del proyectil
+        vy: -400, // Velocidad vertical (hacia arriba)
+        vx: player.facing * 200, // Velocidad horizontal según dirección del jugador
+        alive: true
+      });
+    }
+  }
+});
+window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+// --- Cámara ---
+const camera = { x:0, y:0, width: canvas.width, height: canvas.height };
+
+// --- Juego ---
+let lastTime = performance.now();
+let gameWon = false; // Variable para controlar si el jugador ha ganado
+Promise.all(assets).then(start).catch(e=>{ console.error('Error cargando assets', e); alert('Error cargando imágenes. Revisa que existan en assets/'); });
+
+function start(){
+  // Generar plataformas y enemigos aleatorios al iniciar
+  generateRandomPlatforms();
+  generateRandomEnemies();
+  requestAnimationFrame(loop);
+}
+
+function loop(ts){
+  const dt = Math.min((ts - lastTime) / 1000, 0.05);
+  lastTime = ts;
+  update(dt);
+  render();
+  
+  // Verificar condición de victoria: solo llegar al final
+  const reachedFinishLine = player.x >= FINISH_LINE;
+  
+  if (player.alive && !gameWon && reachedFinishLine) {
+    gameWon = true;
+  }
+  
+  if (player.alive && !gameWon) requestAnimationFrame(loop);
+  else if (!player.alive) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = '#fff';
+    ctx.font = '28px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Has muerto. Refresca la página para reiniciar.', canvas.width/2, canvas.height/2);
+  } else if (gameWon) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = '#ff0';
+    ctx.font = '36px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('¡GANASTE!', canvas.width/2, canvas.height/2);
+    ctx.fillStyle = '#fff';
+    ctx.font = '20px sans-serif';
+    ctx.fillText('Refresca la página para jugar de nuevo', canvas.width/2, canvas.height/2 + 40);
+  }
+}
+
+// --- Update ---
+function update(dt){
+  // Input horizontal
+  let move = 0;
+  if (keys['ArrowLeft'] || keys['a']) move -= 1;
+  if (keys['ArrowRight'] || keys['d']) move += 1;
+  player.vx = AUTO_SCROLL_SPEED + (move * MOVE_SPEED); // Movimiento automático + control del jugador
+  if (move !== 0) player.facing = move > 0 ? 1 : -1;
+
+  // Salto
+  if ((keys['ArrowUp'] || keys[' ']) && player.onGround){
+    player.vy = -JUMP_SPEED;
+    player.onGround = false;
+  }
+
+  // Física
+  player.vy += GRAVITY * dt;
+  player.x += player.vx * dt;
+  player.y += player.vy * dt;
+
+  // Colisiones con plataformas (AABB simple)
+  player.onGround = false;
+  for (const p of platforms){
+    const pl = {x:p.x, y:p.y, w:p.w, h:p.h};
+    const pj = {x:player.x, y:player.y, w:player.w, h:player.h};
+    if (rectsOverlap(pl, pj)){
+      // resolver por eje Y
+      if (player.vy > 0 && (player.y + player.h) - player.vy*dt <= p.y + 2){
+        // cayó sobre la plataforma
+        player.y = p.y - player.h;
+        player.vy = 0;
+        player.onGround = true;
+      } else if (player.vy < 0 && (player.y) - player.vy*dt >= p.y + p.h - 2){
+        // golpeó techo
+        player.y = p.y + p.h;
+        player.vy = 0;
+      } else {
+        // colisión lateral: empuja afuera
+        if (player.x < p.x) player.x = p.x - player.w - 0.1;
+        else player.x = p.x + p.w + 0.1;
+        player.vx = 0;
+      }
+    }
+  }
+
+  // Limites del mundo
+  if (player.y > 2000) player.alive = false;
+
+  // Actualizar proyectiles
+  for (let i = projectiles.length - 1; i >= 0; i--) {
+    const proj = projectiles[i];
+    if (!proj.alive) {
+      projectiles.splice(i, 1);
+      continue;
+    }
+    
+    // Aplicar física a los proyectiles
+    proj.vy += GRAVITY * 0.7 * dt; // Gravedad reducida para proyectiles
+    proj.x += proj.vx * dt;
+    proj.y += proj.vy * dt;
+    
+    // Eliminar proyectiles fuera de pantalla
+    if (proj.y > 2000 || proj.x < -100 || proj.x > 2000) {
+      proj.alive = false;
+      continue;
+    }
+    
+    // Colisiones con plataformas
+    for (const p of platforms) {
+      const plat = {x:p.x, y:p.y, w:p.w, h:p.h};
+      const projRect = {x:proj.x, y:proj.y, w:proj.w, h:proj.h};
+      if (rectsOverlap(plat, projRect)) {
+        proj.alive = false;
+        break;
+      }
+    }
+    
+    // Colisiones con enemigos
+    for (const en of enemies) {
+      if (!en.alive) continue;
+      const enemyRect = {x:en.x, y:en.y, w:en.w, h:en.h};
+      const projRect = {x:proj.x, y:proj.y, w:proj.w, h:proj.h};
+      if (rectsOverlap(enemyRect, projRect)) {
+        en.alive = false;
+        proj.alive = false;
+        break;
+      }
+    }
+  }
+
+  // Enemigos
+  for (const en of enemies){
+    if (!en.alive) continue;
+    en.x += en.vx * dt;
+    // simple patrulla: gira en límites de plataforma o si choca con borde
+    // rebotar si toca borde del mundo
+    if (en.x < 0) en.vx = Math.abs(en.vx);
+    if (en.x > 1800) en.vx = -Math.abs(en.vx);
+    // colisión con plataformas para estar "en el suelo"
+    // (enemies tienen gravidad mínima)
+    let onPlat = false;
+    for (const p of platforms){
+      if (en.x + en.w > p.x && en.x < p.x + p.w){
+        // si está sobre la plataforma (aprox)
+        en.y = p.y - en.h;
+        onPlat = true;
+      }
+    }
+    if (!onPlat){ en.y += 200 * dt; } // cae
+  }
+
+  // Colisiones jugador-enemigo
+  for (const en of enemies){
+    if (!en.alive) continue;
+    const pj = {x:player.x, y:player.y, w:player.w, h:player.h};
+    const pe = {x:en.x, y:en.y, w:en.w, h:en.h};
+    if (rectsOverlap(pj, pe)){
+      // ¿está el jugador descendiendo y encima del enemigo?
+      const playerBottom = player.y + player.h;
+      const enemyTop = en.y;
+      const isStomp = (player.vy > 50) && (playerBottom - en.y < player.h * 0.6);
+      if (isStomp && (player.y + player.h) - en.y < 30){
+        // stomp: mata enemigo y hace rebote pequeño
+        en.alive = false;
+        player.vy = -JUMP_SPEED * 0.55;
+      } else {
+        // colisión lateral -> muerte
+        // para evitar muerte cuando apenas toca por arriba en el mismo frame, 
+        // confirmamos que NO es stomp
+        if (!isStomp) player.alive = false;
+      }
+    }
+  }
+
+  // Cámara que sigue al jugador con límites del mundo
+  camera.x = player.x - canvas.width/2 + player.w/2;
+  camera.x = Math.max(0, Math.min(camera.x, WORLD_WIDTH - canvas.width));
+}
+
+// --- Render ---
+function render(){
+  // fondo repetido/parallax básico
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // dibujar background (si está cargado)
+  if (images.bg){
+    // tilear el fondo para dar sensación de nivel largo
+    const bg = images.bg;
+    const scale = 1.2;
+    const bgW = bg.width * scale;
+    const bgH = bg.height * scale;
+    const startX = - (camera.x * 0.4) % bgW;
+    for (let x = startX - bgW; x < canvas.width + bgW; x += bgW){
+      ctx.drawImage(bg, x, canvas.height - bgH - 60, bgW, bgH);
+    }
+  } else {
+    // fallback sky
+    ctx.fillStyle = '#79bfff';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+  }
+
+  // plataformas (color tierra)
+  ctx.fillStyle = '#8B4513'; // Color tierra/marrón
+  for (const p of platforms){
+    const rx = p.x - camera.x;
+    ctx.fillRect(rx, p.y, p.w, p.h);
+    // Añadir detalles de tierra
+    ctx.fillStyle = '#654321'; // Marrón más oscuro para detalles
+    ctx.fillRect(rx, p.y, p.w, 5); // Borde superior más oscuro
+    ctx.fillStyle = '#8B4513'; // Restaurar color principal
+  }
+  
+  // Dibujar línea de meta
+  const finishX = FINISH_LINE - camera.x;
+  if (finishX >= 0 && finishX <= canvas.width) {
+    ctx.fillStyle = '#FFD700'; // Color dorado
+    ctx.fillRect(finishX, 0, 10, canvas.height);
+    ctx.font = '20px sans-serif';
+    ctx.fillText('META', finishX - 20, 50);
+  }
+
+  // enemigos
+  for (const en of enemies){
+    if (!en.alive) continue;
+    const rx = en.x - camera.x;
+    // dibujar imagen del enemigo si disponible
+    if (images.enemy){
+      ctx.drawImage(images.enemy, rx, en.y, en.w, en.h);
+    } else {
+      ctx.fillStyle = 'maroon';
+      ctx.fillRect(rx, en.y, en.w, en.h);
+    }
+  }
+
+  // Dibujar proyectiles
+  for (const proj of projectiles) {
+    if (!proj.alive) continue;
+    const rx = proj.x - camera.x;
+    
+    // Dibujar proyectil con forma y color de piedra
+    ctx.fillStyle = '#777'; // Color gris de piedra
+    ctx.beginPath();
+    ctx.arc(rx + proj.w/2, proj.y + proj.h/2, proj.w/2, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Agregar detalles para que parezca piedra
+    ctx.fillStyle = '#555'; // Color más oscuro para detalles
+    ctx.beginPath();
+    ctx.arc(rx + proj.w/2 - 3, proj.y + proj.h/2 - 3, 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(rx + proj.w/2 + 4, proj.y + proj.h/2 + 2, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // jugador
+  const prx = player.x - camera.x;
+  if (images.char){
+    // si tu sprite es una sola imagen grande, ajusta drawImage
+    // aquí asumimos que images.char es una imagen del personaje en pose neutral
+    ctx.save();
+    // reflejar si mira a la izquierda
+    if (player.facing < 0){
+      ctx.translate(prx + player.w/2, player.y + player.h/2);
+      ctx.scale(-1,1);
+      ctx.drawImage(images.char, -player.w/2, -player.h/2, player.w, player.h);
+    } else {
+      ctx.drawImage(images.char, prx, player.y, player.w, player.h);
+    }
+    ctx.restore();
+  } else {
+    ctx.fillStyle = 'yellow';
+    ctx.fillRect(prx, player.y, player.w, player.h);
+  }
+
+  // HUD simple
+  ctx.fillStyle = '#fff';
+  ctx.font = '14px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('Pos: ' + Math.round(player.x) + ' px', 10, 20);
+}
+</script>
+</body>
+</html>
